@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       configs: ${{ steps.list-configs.outputs.configs }}
+      scenarios: ${{ steps.list-scenarios.outputs.scenarios }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,7 +22,23 @@ jobs:
         run: |
           configs=$(ls -1 example_configs/*.env | xargs -n1 basename | sed 's/\.env$//' | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "configs=$configs" >> $GITHUB_OUTPUT
-          echo "Found configurations: $configs"
+          echo "Found configs: $configs"
+
+      - name: List test scenarios
+        id: list-scenarios
+        run: |
+          matrix='{"include":['
+          first=true
+          for env in example_configs/*.env; do
+            config=$(basename "$env" .env)
+            for script in $(ls tests/$config/*.sh 2>/dev/null | sort); do
+              [ "$first" = true ] && first=false || matrix+=','
+              matrix+="{\"config\":\"$config\",\"script\":\"$(basename $script)\"}"
+            done
+          done
+          matrix+=']}'
+          echo "scenarios=$matrix" >> $GITHUB_OUTPUT
+          echo "Found scenarios: $matrix"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -45,13 +62,24 @@ jobs:
           path: /tmp/openclaw-test.tar
           retention-days: 1
 
-  test:
+  setup:
     needs: build
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         config: ${{ fromJson(needs.build.outputs.configs) }}
+
+    steps:
+      - name: Ready
+        run: echo "Configuration ${{ matrix.config }} ready for scenarios"
+
+  scenario:
+    needs: [build, setup]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build.outputs.scenarios) }}
 
     steps:
       - name: Checkout repository
@@ -107,25 +135,11 @@ jobs:
         run: |
           echo "Testing configuration: ${{ matrix.config }}"
           bash -c 'source tests/lib.sh && switch_config ${{ matrix.config }}'
-          echo "--- Configuration contents ---"
-          cat .env
 
       - name: Start container
         run: |
           docker compose up -d
           sleep 10
-
-      - name: Dump container status
-        if: always()
-        run: docker ps -a --filter name=${{ matrix.config }}
-
-      - name: Dump container logs
-        if: always()
-        run: docker logs ${{ matrix.config }} 2>&1 || true
-
-      - name: Dump process list
-        if: always()
-        run: docker exec ${{ matrix.config }} ps aux || echo "Container not running"
 
       - name: Verify container is running
         run: |
@@ -134,20 +148,16 @@ jobs:
             exit 1
           fi
 
-      - name: Run test script
+      - name: Run ${{ matrix.script }}
         env:
           DO_SPACES_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_ACCESS_KEY_ID }}
           DO_SPACES_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET_ACCESS_KEY }}
         run: |
-          if [ -x "tests/${{ matrix.config }}/test.sh" ]; then
-            echo "Running tests/${{ matrix.config }}/test.sh"
-            ./tests/${{ matrix.config }}/test.sh ${{ matrix.config }}
-          else
-            echo "No test script found for ${{ matrix.config }}, skipping"
-          fi
+          echo "Running tests/${{ matrix.config }}/${{ matrix.script }}"
+          ./tests/${{ matrix.config }}/${{ matrix.script }} ${{ matrix.config }}
 
-      - name: Dump final container state
-        if: always()
+      - name: Dump container state on failure
+        if: failure()
         run: |
           echo "=== Container status ==="
           docker ps -a --filter name=${{ matrix.config }}
@@ -162,10 +172,7 @@ jobs:
             docker exec ${{ matrix.config }} /command/s6-svstat "/run/service/$svc" 2>/dev/null || echo "unknown"
           done
           echo ""
-          echo "=== Container environment ==="
-          docker exec ${{ matrix.config }} bash -c 'for f in /run/s6/container_environment/*; do [ -f "$f" ] && echo "$(basename $f)=$(cat $f)"; done' 2>/dev/null || echo "No environment"
-          echo ""
-          echo "=== Final container logs ==="
+          echo "=== Container logs ==="
           docker logs ${{ matrix.config }} 2>&1 || true
 
       - name: Cleanup Spaces bucket
